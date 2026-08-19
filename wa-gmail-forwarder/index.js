@@ -24,6 +24,13 @@ const {
 const qrcode = require('qrcode-terminal');
 const nodemailer = require('nodemailer');
 const pino = require('pino');
+const chatLog = require('./lib/chat-log');
+
+// ---------- Konfigurasi perekaman transkrip ----------
+// Merekam SEMUA pesan tanpa filter keyword, dua arah, per chat.
+const CHAT_LOG_ENABLED = (process.env.CHAT_LOG_ENABLED || 'true').toLowerCase() === 'true';
+const CHAT_LOG_EXCLUDE_GROUPS = (process.env.CHAT_LOG_EXCLUDE_GROUPS || 'false').toLowerCase() === 'true';
+const OPERATOR_LABEL = process.env.OPERATOR_LABEL || 'ITSM NAC BNI';
 
 // ---------- Konfigurasi filter (dari .env) ----------
 // Jalur forward-ke-Gmail generik. Ini TERPISAH dari jalur intake tiket NAC —
@@ -130,17 +137,51 @@ async function sendToGmail({ from, chatName, text, timestamp }) {
 }
 
 // ---------- Ekstrak teks dari berbagai tipe pesan WhatsApp ----------
+// Untuk keperluan transkrip, pesan media TANPA caption pun tetap dicatat
+// sebagai penanda (misal "[Gambar]"), supaya alur percakapan tidak bolong.
 function extractText(message) {
   if (!message) return null;
   if (message.conversation) return message.conversation;
   if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
-  if (message.imageMessage?.caption) return `[Gambar] ${message.imageMessage.caption}`;
-  if (message.videoMessage?.caption) return `[Video] ${message.videoMessage.caption}`;
-  if (message.documentMessage?.caption) return `[Dokumen] ${message.documentMessage.caption}`;
+  if (message.imageMessage) return message.imageMessage.caption
+    ? `[Gambar] ${message.imageMessage.caption}` : '[Gambar]';
+  if (message.videoMessage) return message.videoMessage.caption
+    ? `[Video] ${message.videoMessage.caption}` : '[Video]';
+  if (message.documentMessage) {
+    const nama = message.documentMessage.fileName || 'dokumen';
+    return message.documentMessage.caption
+      ? `[Dokumen: ${nama}] ${message.documentMessage.caption}` : `[Dokumen: ${nama}]`;
+  }
+  if (message.audioMessage) {
+    return message.audioMessage.ptt ? '[Pesan suara]' : '[Audio]';
+  }
+  if (message.stickerMessage) return '[Stiker]';
+  if (message.contactMessage) {
+    return `[Kontak: ${message.contactMessage.displayName || '-'}]`;
+  }
+  if (message.locationMessage) return '[Lokasi]';
+  if (message.reactionMessage) {
+    return `[Reaksi: ${message.reactionMessage.text || ''}]`;
+  }
   if (message.buttonsResponseMessage?.selectedDisplayText)
     return message.buttonsResponseMessage.selectedDisplayText;
   if (message.listResponseMessage?.title) return message.listResponseMessage.title;
   return null;
+}
+
+// Tentukan jenis pesan untuk metadata log
+function detectType(message) {
+  if (!message) return 'unknown';
+  if (message.conversation || message.extendedTextMessage) return 'text';
+  if (message.imageMessage) return 'image';
+  if (message.videoMessage) return 'video';
+  if (message.documentMessage) return 'document';
+  if (message.audioMessage) return message.audioMessage.ptt ? 'voice' : 'audio';
+  if (message.stickerMessage) return 'sticker';
+  if (message.contactMessage) return 'contact';
+  if (message.locationMessage) return 'location';
+  if (message.reactionMessage) return 'reaction';
+  return 'other';
 }
 
 // ---------- Cek apakah pesan lolos kriteria filter (untuk forward ke Gmail) ----------
@@ -173,7 +214,12 @@ function matchesAiTrigger({ text, senderNumber, isGroup }) {
 }
 
 // ---------- Panggil Kimi API buat generate balasan ----------
-async function askKimi(userText) {
+// Retry dengan exponential backoff untuk 429 (rate limit / engine overload).
+// Kimi menghitung kuota dari (token request + max_tokens), jadi max_tokens
+// sengaja dijaga kecil supaya tidak boros kuota di tier rendah.
+const KIMI_MAX_RETRY = Number(process.env.KIMI_MAX_RETRY || 3);
+
+async function askKimi(userText, attempt = 0) {
   const res = await fetch(`${KIMI_BASE_URL}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -186,9 +232,20 @@ async function askKimi(userText) {
         { role: 'system', content: AI_SYSTEM_PROMPT },
         { role: 'user', content: userText },
       ],
-      max_tokens: 500,
+      max_tokens: Number(process.env.KIMI_MAX_TOKENS || 300),
     }),
   });
+
+  if (res.status === 429 && attempt < KIMI_MAX_RETRY) {
+    // Hormati Retry-After kalau ada; kalau tidak, backoff 2^attempt detik + jitter
+    const retryAfter = Number(res.headers.get('retry-after'));
+    const waitMs = retryAfter
+      ? retryAfter * 1000
+      : Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500);
+    console.log(`[AI] Kena rate limit, tunggu ${Math.round(waitMs / 1000)}s lalu coba lagi (${attempt + 1}/${KIMI_MAX_RETRY})`);
+    await new Promise((r) => setTimeout(r, waitMs));
+    return askKimi(userText, attempt + 1);
+  }
 
   if (!res.ok) {
     const errText = await res.text();
@@ -283,16 +340,46 @@ async function start() {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue; // skip pesan yang lo kirim sendiri
+      if (!msg.message) continue;
 
       const remoteJid = msg.key.remoteJid || '';
       const isGroup = remoteJid.endsWith('@g.us');
-      const senderNumber = (msg.key.participant || remoteJid).split('@')[0];
+      const fromMe = !!msg.key.fromMe;
+      const senderNumber = fromMe
+        ? (sock.user?.id || '').split(':')[0].split('@')[0]
+        : (msg.key.participant || remoteJid).split('@')[0];
       const text = extractText(msg.message);
 
-      if (!text) continue; // skip tipe pesan yang belum di-handle (stiker, voice note, dll)
+      if (!text) continue; // tipe pesan yang benar-benar tidak bisa direpresentasikan
 
-      const chatName = msg.pushName || senderNumber;
+      const chatName = fromMe
+        ? (remoteJid.split('@')[0])
+        : (msg.pushName || senderNumber);
+
+      // ===== PEREKAMAN TRANSKRIP =====
+      // Merekam SEMUA pesan tanpa filter keyword, dua arah (user & operator),
+      // supaya transkrip percakapan utuh untuk dianalisa tools lain.
+      if (CHAT_LOG_ENABLED) {
+        if (!(CHAT_LOG_EXCLUDE_GROUPS && isGroup)) {
+          try {
+            chatLog.appendMessage({
+              jid: remoteJid,
+              chatName: fromMe ? null : (msg.pushName || null),
+              sender: senderNumber,
+              senderName: fromMe ? OPERATOR_LABEL : (msg.pushName || null),
+              fromMe,
+              text,
+              type: detectType(msg.message),
+              timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
+            });
+          } catch (err) {
+            console.error('[LOG] Gagal menulis transkrip:', err.message);
+          }
+        }
+      }
+
+      // Fitur di bawah ini hanya berlaku untuk pesan MASUK
+      if (fromMe) continue;
 
       if (matchesFilter({ text, senderNumber, isGroup })) {
         console.log(`[MATCH] ${chatName}: ${text}`);
