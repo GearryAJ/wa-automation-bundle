@@ -14,17 +14,58 @@
  */
 
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const dns = require('dns');
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const nodemailer = require('nodemailer');
 const pino = require('pino');
 const chatLog = require('./lib/chat-log');
+const apiServer = require('./lib/server');
+
+// ---------- Konfigurasi Auth & Auto Clean ----------
+const AUTH_DIR = path.join(__dirname, 'auth_info');
+const DELETE_AUTH_ON_EXIT = (process.env.DELETE_AUTH_ON_EXIT || 'false').toLowerCase() === 'true';
+
+function cleanAuthFolder(reason = '') {
+  try {
+    if (fs.existsSync(AUTH_DIR)) {
+      if (currentSock) {
+        try {
+          currentSock.ev.removeAllListeners();
+          currentSock.end?.();
+        } catch (_) {}
+      }
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+          console.log(`[AUTH] Folder auth_info berhasil dihapus otomatis (${reason || 'clean'}).`);
+          break;
+        } catch (err) {
+          if (attempt === 3) {
+            console.error(`[AUTH] Gagal menghapus folder auth_info: ${err.message}`);
+          } else {
+            const waitTill = Date.now() + 300;
+            while (Date.now() < waitTill) {}
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[AUTH] Error saat membersihkan auth_info: ${err.message}`);
+  }
+}
 
 // ---------- Konfigurasi perekaman transkrip ----------
 // Merekam SEMUA pesan tanpa filter keyword, dua arah, per chat.
@@ -61,11 +102,35 @@ const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-k2.6';
 const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.moonshot.ai/v1';
 const AI_SYSTEM_PROMPT =
   process.env.AI_SYSTEM_PROMPT ||
-  'Kamu adalah asisten yang membalas pesan WhatsApp dengan ramah, singkat, dan membantu. Jawab dalam Bahasa Indonesia kecuali ditanya dalam bahasa lain.';
+  'Kamu adalah Helpdesk IT Jaringan & NAC di Bank Negara Indonesia (BNI) yang ramah dan interaktif. Tugasmu membantu pegawai BNI yang terkendala akses Intranet. Kumpulkan data format: Name & NPP, Hostname, MAC Address, IP Address, Divisi, Department, Lokasi, Lantai, Kendala. Jika form sudah diisi, sampaikan bahwa data sudah diterima dan sedang dilakukan pengecekan oleh tim teknis.';
 
 // Cooldown sederhana per nomor, biar nggak boros biaya API kalau ada yang spam trigger
 const AI_COOLDOWN_MS = Number(process.env.AI_COOLDOWN_SECONDS || 10) * 1000;
 const lastAiReplyAt = new Map();
+
+// Jumlah pesan terakhir yang dikirim ke AI sebagai konteks percakapan
+const AI_HISTORY_LIMIT = Number(process.env.AI_HISTORY_LIMIT || 20);
+
+/**
+ * Baca history chat dari file JSONL log, konversi jadi format messages Kimi.
+ * Hanya ambil N pesan terakhir (AI_HISTORY_LIMIT) untuk hemat token.
+ */
+function loadChatHistory(jid) {
+  try {
+    const logFile = path.join(chatLog.LOG_DIR, chatLog.jidToFilename(jid));
+    if (!fs.existsSync(logFile)) return [];
+    const allMessages = chatLog.readMessages(logFile);
+    // Ambil hanya pesan terakhir sesuai limit
+    const recent = allMessages.slice(-AI_HISTORY_LIMIT);
+    return recent.map((m) => ({
+      role: m.from_me ? 'assistant' : 'user',
+      content: m.text || '[non-text]',
+    }));
+  } catch (err) {
+    console.error('[AI] Gagal baca history chat:', err.message);
+    return [];
+  }
+}
 
 // ---------- Konfigurasi NAC ticket intake (parsing dilakukan di Apps Script) ----------
 // Bot hanya: (1) deteksi format & forward chat mentah ke Gmail,
@@ -83,25 +148,24 @@ function looksLikeNacIntake(text) {
   return /Name\s*&\s*NPP\s*:/i.test(text);
 }
 
-// Kirim email intake berisi META (JID pengirim) + isi chat MENTAH.
-// Apps Script yang akan mem-parse isinya.
-async function forwardNacRawEmail({ jid, name, text, timestamp }) {
-  const uniqueId = `${timestamp}-${Math.random().toString(36).slice(2, 8)}`;
-  const subject = `${NAC_SUBJECT_TAG} ${uniqueId}`;
-  const body =
-    `===WA-META===\n` +
-    `JID: ${jid}\n` +
-    `NAME: ${name || '-'}\n` +
-    `TS: ${timestamp}\n` +
-    `===MESSAGE===\n` +
-    `${text}\n`;
-
-  await transporter.sendMail({
-    from: process.env.GMAIL_USER,
-    to: NAC_INTAKE_EMAIL,
-    subject,
-    text: body,
+// Kirim data intake langsung ke Apps Script via POST
+async function postNacIntakeData({ jid, name, text }) {
+  if (!GAS_WEBHOOK_URL) throw new Error('GAS_WEBHOOK_URL belum diset');
+  const response = await fetch(GAS_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'intake',
+      secret: GAS_SHARED_SECRET,
+      jid,
+      name,
+      text,
+    }),
   });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json();
+  if (!data.success) throw new Error(data.error || 'Unknown error');
+  return data;
 }
 
 // ---------- Setup Gmail transporter ----------
@@ -207,6 +271,9 @@ function matchesAiTrigger({ text, senderNumber, isGroup }) {
   if (EXCLUDE_GROUPS && isGroup) return false;
   if (SENDERS.length > 0 && !SENDERS.some((s) => senderNumber.includes(s))) return false;
 
+  // Jika keyword berisi '*', balas SEMUA pesan tanpa filter keyword
+  if (AI_TRIGGER_KEYWORDS.includes('*')) return true;
+
   // Wajib ada keyword trigger yang diset — biar nggak auto-reply ke semua orang tanpa sengaja
   if (AI_TRIGGER_KEYWORDS.length === 0) return false;
   const lower = (text || '').toLowerCase();
@@ -219,22 +286,30 @@ function matchesAiTrigger({ text, senderNumber, isGroup }) {
 // sengaja dijaga kecil supaya tidak boros kuota di tier rendah.
 const KIMI_MAX_RETRY = Number(process.env.KIMI_MAX_RETRY || 3);
 
-async function askKimi(userText, attempt = 0) {
-  const res = await fetch(`${KIMI_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${KIMI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: KIMI_MODEL,
-      messages: [
-        { role: 'system', content: AI_SYSTEM_PROMPT },
-        { role: 'user', content: userText },
-      ],
-      max_tokens: Number(process.env.KIMI_MAX_TOKENS || 300),
-    }),
-  });
+async function askKimi(chatMessages, attempt = 0) {
+  let res;
+  try {
+    res = await fetch(`${KIMI_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${KIMI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: KIMI_MODEL,
+        messages: chatMessages,
+        max_tokens: Number(process.env.KIMI_MAX_TOKENS || 500),
+      }),
+    });
+  } catch (netErr) {
+    if (attempt < KIMI_MAX_RETRY) {
+      const waitMs = Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500);
+      console.log(`[AI] Gagal koneksi (${netErr.message}), coba lagi dalam ${Math.round(waitMs / 1000)}s (${attempt + 1}/${KIMI_MAX_RETRY})...`);
+      await new Promise((r) => setTimeout(r, waitMs));
+      return askKimi(chatMessages, attempt + 1);
+    }
+    throw new Error(`Koneksi ke Kimi API gagal: ${netErr.cause?.message || netErr.message}`);
+  }
 
   if (res.status === 429 && attempt < KIMI_MAX_RETRY) {
     // Hormati Retry-After kalau ada; kalau tidak, backoff 2^attempt detik + jitter
@@ -244,7 +319,7 @@ async function askKimi(userText, attempt = 0) {
       : Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500);
     console.log(`[AI] Kena rate limit, tunggu ${Math.round(waitMs / 1000)}s lalu coba lagi (${attempt + 1}/${KIMI_MAX_RETRY})`);
     await new Promise((r) => setTimeout(r, waitMs));
-    return askKimi(userText, attempt + 1);
+    return askKimi(chatMessages, attempt + 1);
   }
 
   if (!res.ok) {
@@ -260,9 +335,11 @@ async function askKimi(userText, attempt = 0) {
 // Apps Script menaruh antrian {id, type, jid, ticket, message} di sheet Outbox.
 // type CONFIRM = balasan ke pengirim, type FORWARD = teruskan ke engineer.
 // Isi pesan sudah dirakit di Apps Script, bot tinggal mengirim.
+let currentSock = null;
 let pollingStarted = false;
 
-async function pollOutboxOnce(sock) {
+async function pollOutboxOnce() {
+  if (!currentSock) return;
   const res = await fetch(GAS_WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -277,7 +354,7 @@ async function pollOutboxOnce(sock) {
     if (item.type === 'CONFIRM' && !NAC_CONFIRM_REPLY) continue;
 
     try {
-      await sock.sendMessage(item.jid, { text: item.message });
+      await currentSock.sendMessage(item.jid, { text: item.message });
       await fetch(GAS_WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -292,20 +369,30 @@ async function pollOutboxOnce(sock) {
   }
 }
 
-function startConfirmationPolling(sock) {
+function startConfirmationPolling() {
   if (pollingStarted) return; // biar nggak dobel saat reconnect
   if (!NAC_ENABLED || !GAS_WEBHOOK_URL || !GAS_SHARED_SECRET) return;
   pollingStarted = true;
   console.log(`[NAC] Polling outbox aktif tiap ${POLL_INTERVAL_MS / 1000} detik`);
   setInterval(() => {
-    pollOutboxOnce(sock).catch((err) =>
+    pollOutboxOnce().catch((err) =>
       console.error('[NAC] Error polling:', err.message)
     );
   }, POLL_INTERVAL_MS);
 }
 
 // ---------- Main ----------
+let isReconnecting = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 8;
+
 async function start() {
+  if (currentSock?.ev) {
+    try {
+      currentSock.ev.removeAllListeners();
+    } catch (_) {}
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
   const { version } = await fetchLatestBaileysVersion();
 
@@ -314,6 +401,8 @@ async function start() {
     auth: state,
     logger: pino({ level: 'silent' }), // ganti 'debug' kalau mau lihat log detail
   });
+
+  currentSock = sock;
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -326,13 +415,49 @@ async function start() {
     }
 
     if (connection === 'close') {
+      apiServer.emitStatusUpdate({ status: 'disconnected' });
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      console.log('[WA] Koneksi terputus.', loggedOut ? 'Logged out — hapus folder auth_info lalu scan ulang.' : 'Mencoba reconnect...');
-      if (!loggedOut) start();
+      const errorMsg = lastDisconnect?.error?.message || '';
+      console.log(`[WA] Koneksi terputus (status: ${statusCode || 'unknown'}${errorMsg ? ', ' + errorMsg : ''}).`);
+
+      if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        console.log('[WA] Sesi telah logout / di-putus (cut manual) dari WhatsApp.');
+        cleanAuthFolder('Sesi logout / di-cut manual');
+        console.log('[WA] Folder auth_info telah otomatis dibersihkan. Silakan jalankan ulang untuk scan QR.');
+        process.exit(0);
+      }
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        console.log('[WA] Sesi dibuka di tempat/perangkat lain (connectionReplaced). Reconnect dihentikan agar tidak terjadi loop.');
+        return;
+      }
+      if (statusCode === DisconnectReason.badSession) {
+        console.log('[WA] Sesi auth corrupt / tidak valid (badSession).');
+        cleanAuthFolder('badSession');
+        console.log('[WA] Folder auth_info telah otomatis dibersihkan. Silakan jalankan ulang untuk scan QR.');
+        process.exit(0);
+      }
+
+      if (isReconnecting) return;
+      isReconnecting = true;
+
+      reconnectAttempts++;
+      if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        console.error(`[WA] Gagal reconnect setelah ${MAX_RECONNECT_ATTEMPTS} kali percobaan. Berhenti untuk mencegah loop.`);
+        process.exit(1);
+      }
+
+      const delayMs = Math.min(3000 * Math.pow(1.5, reconnectAttempts - 1), 20000);
+      console.log(`[WA] Menunggu ${(delayMs / 1000).toFixed(1)} detik sebelum mencoba reconnect (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+      setTimeout(() => {
+        isReconnecting = false;
+        start().catch((err) => console.error('[FATAL]', err));
+      }, delayMs);
     } else if (connection === 'open') {
+      apiServer.emitStatusUpdate({ status: 'connected' });
+      reconnectAttempts = 0;
+      isReconnecting = false;
       console.log('[WA] Terhubung. Menunggu pesan masuk...');
-      startConfirmationPolling(sock);
+      startConfirmationPolling();
     }
   });
 
@@ -362,7 +487,7 @@ async function start() {
       if (CHAT_LOG_ENABLED) {
         if (!(CHAT_LOG_EXCLUDE_GROUPS && isGroup)) {
           try {
-            chatLog.appendMessage({
+            const entry = {
               jid: remoteJid,
               chatName: fromMe ? null : (msg.pushName || null),
               sender: senderNumber,
@@ -371,7 +496,39 @@ async function start() {
               text,
               type: detectType(msg.message),
               timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
-            });
+            };
+            
+            if (entry.type === 'image' || entry.type === 'document') {
+              try {
+                // Gunakan downloadContentFromMessage sebagai fallback yang lebih low-level
+                const msgType = entry.type === 'image' ? 'image' : 'document';
+                const mediaMessage = msg.message.imageMessage || msg.message.documentMessage;
+                
+                if (mediaMessage) {
+                  const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
+                  const stream = await downloadContentFromMessage(mediaMessage, msgType);
+                  let buffer = Buffer.from([]);
+                  for await (const chunk of stream) {
+                    buffer = Buffer.concat([buffer, chunk]);
+                  }
+                  
+                  const PUBLIC_MEDIA = path.join(__dirname, 'public', 'media');
+                  if (!fs.existsSync(PUBLIC_MEDIA)) {
+                    fs.mkdirSync(PUBLIC_MEDIA, { recursive: true });
+                  }
+                  const ext = entry.type === 'image' ? 'jpg' : (mediaMessage.fileName?.split('.').pop() || 'bin');
+                  const filename = `${entry.timestamp}_${senderNumber}_${Date.now()}.${ext}`;
+                  const filepath = path.join(PUBLIC_MEDIA, filename);
+                  fs.writeFileSync(filepath, buffer);
+                  entry.mediaUrl = `/media/${filename}`;
+                }
+              } catch (mediaErr) {
+                console.error('[LOG] Gagal download media:', mediaErr.message);
+                console.error(mediaErr.stack);
+              }
+            }
+            chatLog.appendMessage(entry);
+            apiServer.emitMessageReceived(entry);
           } catch (err) {
             console.error('[LOG] Gagal menulis transkrip:', err.message);
           }
@@ -391,21 +548,45 @@ async function start() {
         });
       }
 
-      // Deteksi format NAC/ClearPass -> forward chat MENTAH ke Gmail.
-      // Parsing & pembuatan tiket dilakukan di Apps Script (bukan di sini).
-      // Balasan ke user dikirim belakangan lewat loop polling (lihat bawah).
+      // Deteksi format NAC/ClearPass -> POST langsung ke Apps Script v2
+      // Apps Script akan mem-parse, buat tiket, dan langsung return response.
       if (NAC_ENABLED && looksLikeNacIntake(text)) {
         try {
-          await forwardNacRawEmail({
+          const result = await postNacIntakeData({
             jid: remoteJid,
             name: chatName,
             text,
-            timestamp: msg.messageTimestamp,
           });
-          console.log(`[NAC] Chat dari ${chatName} diforward ke Gmail untuk diproses Apps Script`);
+          console.log(`[NAC] Berhasil POST intake dari ${chatName}, Tiket: ${result.ticket || '-'}`);
+
+          if (NAC_CONFIRM_REPLY && result.confirm_text) {
+            await sock.sendMessage(remoteJid, { text: result.confirm_text }, { quoted: msg });
+            
+            if (CHAT_LOG_ENABLED) {
+              try {
+                chatLog.appendMessage({
+                  jid: remoteJid,
+                  chatName: msg.pushName || null,
+                  sender: (sock.user?.id || '').split(':')[0].split('@')[0],
+                  senderName: OPERATOR_LABEL,
+                  fromMe: true,
+                  text: result.confirm_text,
+                  type: 'text',
+                  timestamp: Math.floor(Date.now() / 1000),
+                });
+              } catch (logErr) {
+                console.error('[LOG] Gagal catat balasan NAC:', logErr.message);
+              }
+            }
+          }
         } catch (err) {
-          console.error('[NAC] Gagal forward email:', err.message);
+          console.error('[NAC] Gagal POST intake:', err.message);
+          // Fallback balasan error jika gagal POST
+          if (NAC_CONFIRM_REPLY) {
+            await sock.sendMessage(remoteJid, { text: 'Mohon maaf, sistem pembuatan tiket sedang sibuk. Mohon ulangi beberapa saat lagi atau hubungi tim support.' }, { quoted: msg });
+          }
         }
+        continue; // Skip AI processing kalau sudah masuk flow NAC intake
       }
 
       if (matchesAiTrigger({ text, senderNumber, isGroup })) {
@@ -416,10 +597,40 @@ async function start() {
         } else {
           lastAiReplyAt.set(senderNumber, now);
           try {
-            const aiReply = await askKimi(text);
+            // Baca history percakapan dari log, lalu tambahkan pesan terbaru
+            const history = loadChatHistory(remoteJid);
+            const chatMessages = [
+              { role: 'system', content: AI_SYSTEM_PROMPT },
+              ...history,
+              { role: 'user', content: text },
+            ];
+            // Deduplikasi: jika pesan terakhir di history sama dengan pesan terbaru, hapus duplikat
+            if (history.length > 0 && history[history.length - 1].role === 'user' && history[history.length - 1].content === text) {
+              chatMessages.splice(chatMessages.length - 1, 1);
+            }
+            const aiReply = await askKimi(chatMessages);
             if (aiReply) {
-              await sock.sendMessage(remoteJid, { text: aiReply });
+              // Balas dengan quoting pesan asal agar selalu terhubung di chat thread WA (termasuk LID)
+              await sock.sendMessage(remoteJid, { text: aiReply }, { quoted: msg });
               console.log(`[AI] Balas ke ${chatName}: ${aiReply.slice(0, 80)}${aiReply.length > 80 ? '...' : ''}`);
+
+              // Catat balasan AI ke file transkrip log
+              if (CHAT_LOG_ENABLED) {
+                try {
+                  chatLog.appendMessage({
+                    jid: remoteJid,
+                    chatName: msg.pushName || null,
+                    sender: (sock.user?.id || '').split(':')[0].split('@')[0],
+                    senderName: OPERATOR_LABEL,
+                    fromMe: true,
+                    text: aiReply,
+                    type: 'text',
+                    timestamp: Math.floor(Date.now() / 1000),
+                  });
+                } catch (logErr) {
+                  console.error('[LOG] Gagal catat balasan AI:', logErr.message);
+                }
+              }
             }
           } catch (err) {
             console.error('[AI] Gagal dapat balasan:', err.message);
@@ -430,4 +641,34 @@ async function start() {
   });
 }
 
+apiServer.initServer(process.env.DASHBOARD_API_PORT || 3001, async (jid, msg) => {
+  if (currentSock) {
+    return await currentSock.sendMessage(jid, msg);
+  }
+  throw new Error('WhatsApp not connected');
+});
+
 start().catch((err) => console.error('[FATAL]', err));
+
+// Listener input terminal untuk cut manual secara interaktif (ketik 'cut', 'logout', atau 'clean' lalu Enter)
+if (process.stdin.isTTY) {
+  process.stdin.setEncoding('utf-8');
+  process.stdin.on('data', (data) => {
+    const input = data.toString().trim().toLowerCase();
+    if (input === 'cut' || input === 'logout' || input === 'clean') {
+      console.log('\n[AUTH] Menerima perintah cut manual dari console...');
+      cleanAuthFolder('Perintah cut/logout console');
+      console.log('[WA] Selesai. Folder auth_info telah dibersihkan.');
+      process.exit(0);
+    }
+  });
+}
+
+// Sinyal terminasi (Ctrl + C)
+process.on('SIGINT', () => {
+  console.log('\n[WA] Sinyal berhenti (Ctrl+C) diterima.');
+  if (DELETE_AUTH_ON_EXIT) {
+    cleanAuthFolder('Cut manual (SIGINT / Exit)');
+  }
+  process.exit(0);
+});

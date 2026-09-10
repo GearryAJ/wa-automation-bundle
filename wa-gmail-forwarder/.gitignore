@@ -4,3 +4,5 @@ auth_info/
 logs/
 exports/
 log.txt
+tickets/
+public/media/

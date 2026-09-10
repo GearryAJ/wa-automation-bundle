@@ -16,6 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const ticketExtractor = require('./ticket-extractor');
 
 const LOG_DIR = process.env.CHAT_LOG_DIR || 'logs';
 
@@ -56,8 +57,23 @@ function appendMessage(entry) {
     from_me: !!entry.fromMe,
     type: entry.type || 'text',
     text: entry.text,
+    media_url: entry.mediaUrl || null,
   };
   fs.appendFileSync(file, JSON.stringify(record) + '\n', 'utf8');
+
+  // Auto-update file JSON tiket tiap ada chat baru masuk/keluar dari nomor ini
+  try {
+    const data = ticketExtractor.extractTicketsFromLog(file);
+    if (data && data.total_tickets > 0) {
+      const TICKET_DIR = process.env.TICKET_DIR || 'tickets';
+      if (!fs.existsSync(TICKET_DIR)) fs.mkdirSync(TICKET_DIR, { recursive: true });
+      const outPath = path.join(TICKET_DIR, jidToFilename(entry.jid).replace('.jsonl', '_tickets.json'));
+      fs.writeFileSync(outPath, JSON.stringify(data, null, 2), 'utf8');
+    }
+  } catch (err) {
+    console.error('[LOG] Gagal auto-update JSON tiket:', err.message);
+  }
+
   return file;
 }
 
